@@ -350,7 +350,7 @@ def get_minimap(position, zoom_lvl=10):
 
 
 def test_get_minimap():
-    position = (32.670978,-117.241656)
+    position = (32.670978,-117.241656) # Cabrillo National Monument
     minimap = get_minimap(position)
     minimap.save(settings.output_directory + "minimap.png")
 
