@@ -1,0 +1,18 @@
+.env
+venv
+.vscode
+.idea
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+*.log
+
+# route data
+*.gpx
+/data
+
+# Output
+output*.odp
