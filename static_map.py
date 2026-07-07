@@ -1,6 +1,9 @@
 import json
 import gpxpy
-from moviepy.editor import VideoClip
+try:
+    from moviepy.editor import VideoClip
+except ImportError:
+    from moviepy import VideoClip
 import numpy as np
 from PIL import Image, ImageDraw
 import PIL
@@ -23,7 +26,6 @@ class StaticMap:
         py = self.image.height - py
         return (px, py)
     
-    
     def __repr__(self) -> str:
         return f"StaticMap(center={self.center}, world_coord_size={self.world_coord_size}, size={(self.image.width, self.image.height)})"
 
@@ -44,7 +46,6 @@ class StaticMap:
         return img
     
     def create_route_animation(self, route: list, route_segment_bounds: tuple[int, int], flight_segments, output_path, km_per_second=30):
-
         world_route = [lat_lng_to_world_coords(point.latitude, point.longitude) for point in route]
 
         route_segment = route[route_segment_bounds[0]:route_segment_bounds[1] + 1]
@@ -56,7 +57,6 @@ class StaticMap:
         # to travel at constant speed, we need to calculate how long each segment should take
         segment_duration = [calculate_distance(route_segment[i], route_segment[i + 1]) / km_per_second for i in range(len(route_segment) - 1)]
 
-
         def make_frame(t):
             img = self.image.copy()
             draw = ImageDraw.Draw(img)
@@ -67,6 +67,15 @@ class StaticMap:
             while segment < len(segment_duration) and total_time + segment_duration[segment] < t:
                 total_time += segment_duration[segment]
                 segment += 1
+
+            if segment >= len(segment_duration):
+                segment = len(segment_duration) - 1
+                segment_progress = 1.0
+            else:
+                if segment_duration[segment] != 0:
+                    segment_progress = min(max((t - total_time) / segment_duration[segment], 0.0), 1.0)
+                else:
+                    segment_progress = 0.0
 
             # Draw the route before the animation starts
             for (i, f) in enumerate(flight_segments):
@@ -95,13 +104,10 @@ class StaticMap:
                 if start_in_frame or end_in_frame:
                     self.add_flight_path(draw, f_start, f_end)
 
-
             # insert the current route sector up to the current point
             self.add_route(draw, route[route_segment_bounds[0]:route_segment_bounds[0] + segment + 1])            
 
-            if segment_duration[segment] != 0:
-                # calculate the progress within the segment
-                segment_progress = (t - total_time) / segment_duration[segment]
+            if segment_progress > 0:
                 # calculate the position of the current point
                 end = np.add(route_segment_world[segment], segment_progress * np.subtract(route_segment_world[segment + 1], route_segment_world[segment]))
                 px, py = self.to_px(*end)
@@ -116,7 +122,6 @@ class StaticMap:
             draw.ellipse((px - 5, py - 5, px + 5, py + 5), fill="red")
             return np.array(img)
 
-        
         animation = VideoClip(make_frame, duration=duration)
         animation.write_videofile(output_path, fps=24)
 
@@ -126,23 +131,8 @@ class StaticMap:
         world_x, world_y = lat_lng_to_world_coords(end.latitude, end.longitude)
         x2, y2 = self.to_px(world_x, world_y)    
 
-        #draw.line((x1, y1, x2, y2), fill="blue", width=5)
-        # Draw an arc instead of a line
-
-        # Control point for the Bezier curve (for the arc)
-        world_x, world_y = lat_lng_to_world_coords(start.latitude, start.longitude)
-        x1, y1 = self.to_px(world_x, world_y)
-        world_x, world_y = lat_lng_to_world_coords(end.latitude, end.longitude)
-        x2, y2 = self.to_px(world_x, world_y)    
-
-        #draw.line((x1, y1, x2, y2), fill="blue", width=5)
-        # Draw an arc instead of a line
-
         # Control point for the Bezier curve (for the arc)
         cx, cy = (x1 + x2) / 2, (y1 + y2) / 2 - 150  # Adjust the -150 for more or less arc
-
-        # Calculate the number of dashes to draw by dividing the arc length by the dash length
-
 
         # Generate points along the Bezier curve
         t_values = np.linspace(0, 1, num=1000)
@@ -181,7 +171,6 @@ class StaticMap:
         draw = ImageDraw.Draw(img)
         self.add_flight_path(draw, start, end)
         return img
-        
 
     # Function to render an animation of a flight segment
     def create_flight_animation(self, start, end, output_path):
@@ -204,16 +193,6 @@ class StaticMap:
 
         # Convert points to integer tuples
         arc_points = [(int(x), int(y)) for x, y in arc_points]
-
-        # Split up the arc points into dashes (one per n pixels)
-        dash_length = 20
-        dashes = []
-        current_start = 0
-        for i in range(1, len(arc_points)):
-            current_len = np.linalg.norm(np.subtract(arc_points[i], arc_points[current_start]))
-            if current_len > dash_length or (i == len(arc_points) - 1 and current_len > 0):
-                dashes.append(arc_points[current_start:i + 1])
-                current_start = i
 
         # Split up the arc points into dashes (one per n pixels)
         dash_length = 20
@@ -269,9 +248,7 @@ class StaticMap:
                 # Draw interpolated section of the next segment within the current dash
                 draw.line([current_point, tuple(interpolated)], fill="green", width=5)
                 
-                
             draw.ellipse((interpolated[0] - 5, interpolated[1] - 5, interpolated[0] + 5, interpolated[1] + 5), fill="red")
-
 
             return np.array(img)
 
@@ -280,7 +257,7 @@ class StaticMap:
 
 
 def test_draw_route():
-    # Test with route segment from 1339 to 1340 of the final.gpx route
+    # Test with route segment from 1834 to 2070 of the final.gpx route
     output_directory = 'data/tmp/'
     with open(output_directory + 'final.gpx', 'r') as file:
         gpx = gpxpy.parse(file)
@@ -294,7 +271,6 @@ def test_draw_route():
     with_route.save(output_directory + 'route.png')
 
 def test_draw_flight():
-        # Test with route segment from 1339 to 1340 of the final.gpx route
     output_directory = 'data/tmp/'
     with open(output_directory + 'final.gpx', 'r') as file:
         gpx = gpxpy.parse(file)
@@ -304,9 +280,6 @@ def test_draw_flight():
     world_coord_size=(78.143554384, 43.955749341)
     image = Image.open('data/tmp/flight_segment.png') 
     static_map = StaticMap(center, world_coord_size, image)
-    world_1 = lat_lng_to_world_coords(route[segment[0]].latitude, route[segment[0]].longitude)
-    world_2 = lat_lng_to_world_coords(route[segment[1]].latitude, route[segment[1]].longitude)
-    print(world_1, world_2)
     with_route = static_map.draw_flight_path(route[segment[0]], route[segment[1]])
     with_route.save(output_directory + 'flight.png')
 

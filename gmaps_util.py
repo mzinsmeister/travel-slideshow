@@ -6,39 +6,66 @@ from PIL import Image, ImageDraw
 import io
 import requests
 import math
+import time
+import random
+import threading
 from util import calculate_distance, lat_lng_to_world_coords
 from static_map import StaticMap
+
+tile_lock = threading.Lock()
+
+
+def retry_call(func, description, max_retries=3, initial_delay=1):
+    """Executes a function and retries on exception with exponential backoff."""
+    delay = initial_delay
+    for attempt in range(1, max_retries + 1):
+        try:
+            return func()
+        except Exception as e:
+            if attempt == max_retries:
+                raise e
+            print(f"Warning: {description} failed (attempt {attempt}/{max_retries}): {e}. Retrying in {delay:.1f}s...")
+            time.sleep(delay)
+            # exponential backoff with jitter
+            delay = delay * 2 + random.uniform(0, 0.5)
+
 
 # Function to snap points to the nearest road using Google Maps API
 def snap_to_road(gmaps, points):
     snapped_points = []
     i = 0
+    snap_break = getattr(settings, 'snap_break_km', 50)
     while i < len(points):  # API limit of 100 points per request
         prev_i = i
         chunk = []
         next_flight = False
         while i < len(points) and len(chunk) < 100:
-            # Check whether this point has a distance > 50km from the previous point. In that case it's a flight segment
+            # Check whether this point has a distance > snap_break from the previous point. In that case it's a flight segment
             # and we should not snap the points
-            if i > 0 and calculate_distance(points[i - 1], points[i]) > 50:
+            if i > 0 and calculate_distance(points[i - 1], points[i]) > snap_break:
                 next_flight = True
                 break
             chunk.append(points[i])
             i += 1
-        response = gmaps.snap_to_roads(path=[(p.latitude, p.longitude) for p in chunk], interpolate=True)
-        result = []
-        interpolated_intermediate_points = []
-        j = 0
-        while j < len(response):
-            point = response[j]
-            if 'originalIndex' in point:
-                result.extend(interpolated_intermediate_points)
-                result.append((point["location"]["latitude"], point["location"]["longitude"], point["originalIndex"] + prev_i))
-                interpolated_intermediate_points = []
-            else:
-                interpolated_intermediate_points.append((point["location"]["latitude"], point["location"]["longitude"], None))
-            j += 1
-        snapped_points.extend(result)
+
+        if chunk:
+            def do_snap():
+                return gmaps.snap_to_roads(path=[(p.latitude, p.longitude) for p in chunk], interpolate=True)
+            
+            response = retry_call(do_snap, f"snapping {len(chunk)} points to roads")
+            result = []
+            interpolated_intermediate_points = []
+            j = 0
+            while j < len(response):
+                point = response[j]
+                if 'originalIndex' in point:
+                    result.extend(interpolated_intermediate_points)
+                    result.append((point["location"]["latitude"], point["location"]["longitude"], point["originalIndex"] + prev_i))
+                    interpolated_intermediate_points = []
+                else:
+                    interpolated_intermediate_points.append((point["location"]["latitude"], point["location"]["longitude"], None))
+                j += 1
+            snapped_points.extend(result)
 
         if next_flight:
             snapped_points.append((points[i].latitude, points[i].longitude, i))
@@ -46,12 +73,9 @@ def snap_to_road(gmaps, points):
 
     return snapped_points
 
+
 # Function to create the actual route as GPX track points from the snapped points
 # We interpolate the time of snapped intermediate points based on the time of the previous and next correctly snapped points
-# We already identified flight segments before so those should be in the snapped route already
-# However there are some points google maps skips because it thinks they are just "zig zagging noise"
-# We should however still include them in the final route. Also if a snapped point is further than 50m from the actual point
-# we should discard it and all the intermediate points between the previous correctly snapped point and the current one
 def postprocess_snapped_route(snapped_route, gpx):
     route = []
     route_since_last_correctly_snapped = []
@@ -72,37 +96,55 @@ def postprocess_snapped_route(snapped_route, gpx):
                 lastOriginal = route[-1]
                 # add gpx track points with interpolated time for route_since_last_correctly_snapped and add them to route
                 if len(route_since_last_correctly_snapped) > 0:
-                    total_intermediate_points_distance = 0
-                    for i in range(1, len(route_since_last_correctly_snapped)):
-                        total_intermediate_points_distance += calculate_distance(route_since_last_correctly_snapped[i - 1], route_since_last_correctly_snapped[i])
-                    total_intermediate_points_distance += calculate_distance(route_since_last_correctly_snapped[-1], (lat, lon))
+                    path_positions = [(lastOriginal.latitude, lastOriginal.longitude)] + route_since_last_correctly_snapped + [(lat, lon)]
+                    
+                    # Compute cumulative distances along the path
+                    cumulative_distances = [0.0]
+                    total_dist = 0.0
+                    for k in range(1, len(path_positions)):
+                        segment_dist = calculate_distance(path_positions[k - 1], path_positions[k])
+                        total_dist += segment_dist
+                        cumulative_distances.append(total_dist)
+                    
                     total_time_diff = gpx.tracks[0].segments[0].points[lastOriginalIndex].time - lastOriginal.time
-                    for i in range(1, len(route_since_last_correctly_snapped)):
-                        # Calculate the time of the intermediate point based on the distance from the previous correctly snapped point
-                        distance = calculate_distance(route_since_last_correctly_snapped[i - 1], route_since_last_correctly_snapped[i])
-                        time_fraction = distance / total_intermediate_points_distance
+                    
+                    for k in range(1, len(path_positions) - 1):
+                        # Calculate time fraction based on cumulative distance from lastOriginal (index 0)
+                        if total_dist > 0:
+                            time_fraction = cumulative_distances[k] / total_dist
+                        else:
+                            time_fraction = k / (len(path_positions) - 1)
                         time = lastOriginal.time + total_time_diff * time_fraction
-                        gpx_point = gpxpy.gpx.GPXTrackPoint(latitude=route_since_last_correctly_snapped[i][0], longitude=route_since_last_correctly_snapped[i][1], time=time)
+                        gpx_point = gpxpy.gpx.GPXTrackPoint(latitude=path_positions[k][0], longitude=path_positions[k][1], time=time)
                         route.append(gpx_point)
+                    
                     # Add the last point
                     gpx_snapped_original = gpxpy.gpx.GPXTrackPoint(latitude=lat, longitude=lon, time=gpx.tracks[0].segments[0].points[originalIndex].time)
                     route.append(gpx_snapped_original)
                 else:
                     route.append(gpx.tracks[0].segments[0].points[originalIndex])
                 route_since_last_correctly_snapped = []
+            else:
+                # If too far, treat as skipped segment
+                route_since_last_correctly_snapped = []
+                lastOriginalIndex = originalIndex
+                route.append(gpx.tracks[0].segments[0].points[originalIndex])
         else:
             route_since_last_correctly_snapped.append((lat, lon))
     return route
+
 
 # Function to save snapped points to a file
 def save_snapped_points(snapped_points, file_path):
     with open(file_path, 'w') as f:
         json.dump(snapped_points, f)
 
+
 # Function to load snapped points from a file
 def load_snapped_points(file_path):
     with open(file_path, 'r') as f:
         return json.load(f)
+
 
 # Get a bounding box for the animation in center, width, height format
 def get_animation_bbox(route):
@@ -111,8 +153,7 @@ def get_animation_bbox(route):
     max_x = max(world_coords_route, key=lambda x: x[0])[0]
     min_y = min(world_coords_route, key=lambda x: x[1])[1]
     max_y = max(world_coords_route, key=lambda x: x[1])[1]
-    # Check if the first point that doesn't have x_min or x_max as x is between them, otherwise
-    # swap them
+    # Check if the first point that doesn't have x_min or x_max as x is between them, otherwise swap them
     # For only two points we assume the shorter of the two routes was taken
     if len(world_coords_route) == 2:
         if max_x - min_x > 128:
@@ -125,13 +166,14 @@ def get_animation_bbox(route):
                 break
     return ((min_x, max_x), (min_y, max_y))
 
+
 # Desired image dimensions
 output_width = 1920
 output_height = 1080
 
+
 def calculate_optimal_zoom(bbox, output_width, output_height):
     """Calculate the optimal zoom level for a bounding box and output dimensions."""
-
     if bbox[0][0] > bbox[0][1]:
         bbox = ((bbox[0][0], bbox[0][1] + 256), bbox[1])
 
@@ -150,15 +192,12 @@ def calculate_optimal_zoom(bbox, output_width, output_height):
     return 0  # Default to zoom level 0 if none fit
 
 
-# Calculate the optimal zoom level and tile coordinates
-def world_coords_to_tile_coords(x, y, zoom, round_up=False):
+# Calculate the tile coordinates
+def world_coords_to_tile_coords(x, y, zoom):
     """Convert latitude and longitude to tile coordinates."""
     n = 2.0 ** zoom
     tile_x = n * (x / 256)
     tile_y = n * (y / 256)
-    if round_up:
-        tile_x = math.floor(tile_x)
-        tile_y = math.floor(tile_y)
     return int(tile_x), int(tile_y)
 
 
@@ -211,32 +250,48 @@ def relative_position(outer_center, outer_size, inner_center, inner_size):
     
     return relative_position
 
+
 # Define function to fetch tiles
 def fetch_tile(x, y, zoom):
-    """Fetch a tile from Google Maps API."""
-    # First lookup local tile cache
-    # If not found, fetch from Google Maps API
-    if os.path.exists(settings.output_directory + f"tile_cache/{zoom}/{x}_{y}.png"):
-        return Image.open(settings.output_directory + f"tile_cache/{zoom}/{x}_{y}.png")
+    """Fetch a tile from Google Maps API or OpenStreetMap."""
+    source = getattr(settings, 'tile_source', 'google').lower()
+    cache_dir = os.path.join(settings.output_directory, f"tile_cache_{source}/{zoom}")
+    cache_file = os.path.join(cache_dir, f"{x}_{y}.png")
+    
+    with tile_lock:
+        if os.path.exists(cache_file):
+            return Image.open(cache_file)
+            
+    if source == 'osm':
+        url = f"https://tile.openstreetmap.org/{zoom}/{x}/{y}.png"
+        headers = {"User-Agent": "travel-slideshow/1.0 (agentic coding assistant; contact: user@example.com)"}
     else:
+        if not settings.google_maps_api_key:
+            raise ValueError("Google Maps API key is required when tile_source is 'google'")
         url = f"https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={zoom}&key={settings.google_maps_api_key}"
-        response = requests.get(url)
+        headers = {}
+        
+    def do_fetch():
+        response = requests.get(url, headers=headers, timeout=10)
         if response.status_code != 200:
-            raise Exception(f"Failed to fetch tile {x}, {y}, {zoom}")
-        img = Image.open(io.BytesIO(response.content))
-        os.makedirs(settings.output_directory + f"tile_cache/{zoom}/", exist_ok=True)
-        img.save(settings.output_directory + f"tile_cache/{zoom}/{x}_{y}.png")
-        return img
+            raise Exception(f"Failed to fetch tile {x}, {y}, {zoom} from {source}. Status: {response.status_code}")
+        return Image.open(io.BytesIO(response.content))
+        
+    img = retry_call(do_fetch, f"fetching tile {x}, {y}, z={zoom}")
+    
+    with tile_lock:
+        if not os.path.exists(cache_file):
+            os.makedirs(cache_dir, exist_ok=True)
+            img.save(cache_file)
+            
+    return img
+
 
 def fetch_map(bbox, size):
     # Determine zoom level based on desired output dimensions and bounding box
-    # A more complex function would calculate the optimal zoom level.
     zoom = calculate_optimal_zoom(bbox, size[0], size[1])
 
-    # Calculate the world coordinates of the bounding box (0-256)
-
     # Make sure bounding box has correct aspect ratio (while ensuring we don't go outside the world bounds)
-    # Keep in mind that right can be less than left if the bounding box crosses the antimeridian
     aspect_ratio = size[0] / size[1]
     
     ((left_world, right_world), (top_world, bottom_world)) = strech_bbox(bbox, aspect_ratio)
@@ -246,7 +301,6 @@ def fetch_map(bbox, size):
         right_world_larger += 256
 
     # Add 10% both height and width to the bounding box
-
     left_world -= (right_world_larger - left_world) * 0.05
     right_world_larger += (right_world_larger - left_world) * 0.05
     right_world = right_world_larger % 256
@@ -276,14 +330,13 @@ def fetch_map(bbox, size):
             tile = fetch_tile(x_actual, y, zoom)
             output_image.paste(tile, ((x - top_left_tile[0]) * 256, (y - top_left_tile[1]) * 256))
 
-    # Now the image is too large, so we need to crop it to the desired output dimensions (1920x1080) such that the center of the bbox is in the center of the image
-    # Calculate the center of the bbox in world coords
+    # Crop to center
     bbox_center_x = (left_world + right_world) / 2
     bbox_center_y = (top_world + bottom_world) / 2
     bbox_width = right_world_larger - left_world
     bbox_height = bottom_world - top_world
     
-    # Get world_coords of of the image
+    # Get world_coords of the image
     top_left_x = top_left_tile[0] / (2 ** zoom) * 256
     top_left_y = top_left_tile[1] / (2 ** zoom) * 256
     bottom_right_x = (bottom_right_tile_theoretical[0] + 1) / (2 ** zoom) * 256
@@ -291,16 +344,12 @@ def fetch_map(bbox, size):
     image_width = bottom_right_x - top_left_x
     image_height = bottom_right_y - top_left_y
 
-    # We need to cut the image such that the center of the bbox is in the center of the image
-    # and such that image width and height are the same as the bbox width and height
-    # Calculate where the bbox top left corner is in the image
     bbox_left_px = abs(top_left_x - left_world) / image_width * output_image.width
     bbox_top_px = abs(top_left_y - top_world) / image_height * output_image.height
     bbox_right_px = bbox_left_px + bbox_width / image_width * output_image.width
     bbox_bottom_px = bbox_top_px + bbox_height / image_height * output_image.height
 
     output_image = output_image.resize(size, box=(int(bbox_left_px), int(bbox_top_px), int(bbox_right_px), int(bbox_bottom_px)), resample=Image.Resampling.LANCZOS)
-
 
     return StaticMap((bbox_center_x, bbox_center_y), (right_world_larger - left_world, bottom_world - top_world), output_image)
 
@@ -312,7 +361,6 @@ def get_minimap(position, zoom_lvl=10):
 
     extra_tiles = math.ceil(settings.minimap_width / 256 / 2)
     total_tile_width = extra_tiles * 2 + 1
-
 
     # Fetch the tiles for the minimap
     minimap = Image.new("RGB", (256 * total_tile_width, 256 * total_tile_width))
@@ -327,7 +375,6 @@ def get_minimap(position, zoom_lvl=10):
 
     center = (center_tile_world_x + tile_width / 2, center_tile_world_y + tile_width / 2)
 
-    # Crop the minimap to 256x256
     static_map = StaticMap(center, (256 * (total_tile_width / (2 ** zoom_lvl)), 256 * (total_tile_width / (2 ** zoom_lvl))), minimap)
 
     # Get the pixel coordinates of the position
@@ -335,10 +382,7 @@ def get_minimap(position, zoom_lvl=10):
 
     minimap_size = settings.minimap_width
 
-    # Cut a 256x256 square around the position
-    #minimap = minimap.crop((int(pixel_coords[0] - 128), int(pixel_coords[1] - 128), int(pixel_coords[0] + 128), int(pixel_coords[1] + 128)))
-
-    # cut a minimap_sizexminimap_size square around the position
+    # Cut a square around the position
     minimap = minimap.crop((int(pixel_coords[0] - minimap_size / 2), int(pixel_coords[1] - minimap_size / 2), int(pixel_coords[0] + minimap_size / 2), int(pixel_coords[1] + minimap_size / 2)))
 
     # Draw a red circle around the position
@@ -350,9 +394,10 @@ def get_minimap(position, zoom_lvl=10):
 
 
 def test_get_minimap():
-    position = (32.670978,-117.241656) # Cabrillo National Monument
+    position = (32.670978, -117.241656) # Cabrillo National Monument
     minimap = get_minimap(position)
     minimap.save(settings.output_directory + "minimap.png")
+
 
 if __name__ == "__main__":
     test_get_minimap()
